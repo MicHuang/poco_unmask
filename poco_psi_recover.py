@@ -20,6 +20,28 @@ Tip: start with --limit to get quick feedback. If outputs look good, remove it f
 import argparse
 import hashlib
 from pathlib import Path
+from typing import Optional
+
+# Optional GPU (Numba CUDA) support — loaded lazily and only when requested
+_NUMBA_CUDA_AVAILABLE = False
+try:
+    from numba import cuda  # type: ignore
+    # is_available() can raise if drivers are missing; guard it
+    try:
+        _NUMBA_CUDA_AVAILABLE = bool(cuda.is_available())
+    except Exception:
+        _NUMBA_CUDA_AVAILABLE = False
+except Exception:
+    _NUMBA_CUDA_AVAILABLE = False
+
+# Optional CuPy support (faster + working on your box)
+_CUPY_AVAILABLE = False
+try:
+    import cupy as _cp  # type: ignore
+    _ = _cp.cuda.runtime.getDeviceCount()
+    _CUPY_AVAILABLE = True
+except Exception:
+    _CUPY_AVAILABLE = False
 
 MAGICS = {
     b"\xFF\xD8\xFF": ".jpg",
@@ -685,6 +707,235 @@ def smart_repxor_probe(buf: bytes, offsets: list[int], kmin: int = 2, kmax: int 
                         return (f"smart-repxor klen={klen} off={off} scan@{pos}", off + pos, trimmed, ".jpg", dec)
     return None
 
+
+# ---- CuPy-accelerated smart repeating-XOR probe (optional) ----
+def cupy_smart_repxor_probe(buf: bytes, offsets: list[int], kmin: int = 2, kmax: int = 32, max_scan: int = 65536, *, batch: int = 256):
+    """CuPy variant of smart_repxor_probe.
+    Strategy: CPU derives candidate keys from JPEG cribs (same as CPU path),
+    then uses CuPy to batch-scan the first `max_scan` bytes for SOI (FF D8 FF).
+    Returns same tuple as CPU/GPU probes or None.
+    """
+    if not _CUPY_AVAILABLE:
+        return None
+    try:
+        import numpy as np
+        import cupy as cp
+    except Exception:
+        return None
+
+    n = len(buf)
+    dbuf = cp.asarray(np.frombuffer(buf, dtype=np.uint8))
+
+    for off in offsets:
+        m = min(max_scan, n - off)
+        if m < 8:
+            continue
+
+        # ---- derive candidate keys from cribs (same as CPU) ----
+        enc = buf[off: off + 64]
+        cand_keys: list[bytes] = []
+        cand_lens: list[int] = []
+        for crib in JPEG_CRIBS:
+            for klen in range(kmin, kmax + 1):
+                key = [None] * klen
+                ok = True
+                for idx, eb in crib.items():
+                    if idx >= len(enc):
+                        ok = False; break
+                    kb = enc[idx] ^ eb
+                    p = idx % klen
+                    if key[p] is None:
+                        key[p] = kb
+                    elif key[p] != kb:
+                        ok = False; break
+                if not ok:
+                    continue
+                key_bytes = bytes((b if b is not None else 0) for b in key)
+                cand_keys.append(key_bytes)
+                cand_lens.append(klen)
+        if not cand_keys:
+            continue
+
+        max_k = max(cand_lens)
+        # pack keys → shape (K, max_k)
+        kpad = np.zeros((len(cand_keys), max_k), dtype=np.uint8)
+        for i, kbytes in enumerate(cand_keys):
+            kpad[i, :len(kbytes)] = np.frombuffer(kbytes, dtype=np.uint8)
+
+        d_slice = dbuf[off:off+m]
+        d_kpad = cp.asarray(kpad)              # (K, max_k)
+        d_lens = cp.asarray(np.array(cand_lens, dtype=np.int32))  # (K,)
+
+        idx = cp.arange(m-2, dtype=cp.int32)   # positions to test
+
+        # batch to save memory
+        for s in range(0, len(cand_keys), batch):
+            e = min(len(cand_keys), s + batch)
+            sub_kpad = d_kpad[s:e]             # (B, max_k)
+            sub_lens = d_lens[s:e]             # (B,)
+
+            # gather key bytes for pos, pos+1, pos+2 (shape all (B, m-2))
+            mod0 = cp.remainder(idx[None, :], sub_lens[:, None])
+            mod1 = cp.remainder(idx[None, :]+1, sub_lens[:, None])
+            mod2 = cp.remainder(idx[None, :]+2, sub_lens[:, None])
+
+            rows = cp.arange(e - s)[:, None]
+            k0 = sub_kpad[rows, mod0]
+            k1 = sub_kpad[rows, mod1]
+            k2 = sub_kpad[rows, mod2]
+
+            a0 = (d_slice[:m-2][None, :] ^ k0)
+            a1 = (d_slice[1:m-1][None, :] ^ k1)
+            a2 = (d_slice[2:m][None, :] ^ k2)
+
+            hits = cp.where((a0 == 0xFF) & (a1 == 0xD8) & (a2 == 0xFF))
+            if hits[0].size > 0:
+                ki = int(hits[0][0]) + s
+                pos = int(hits[1][0])
+                key_bytes = cand_keys[ki]
+
+                # CPU verify & trim
+                dec = repxor(buf[off:], key_bytes)
+                if looks_like_image(dec[:16]) == ".jpg":
+                    trimmed = trim_to_image_ext(dec, ".jpg")
+                    if trimmed and looks_plausible_jpeg(trimmed):
+                        return (f"smart-repxor[CuPy] klen={len(key_bytes)} off={off} scan@{pos}", off + pos, trimmed, ".jpg", dec)
+                sd = find_magic_positions(dec, max_scan)
+                if sd and sd[0][1] == ".jpg":
+                    trimmed = trim_to_image_ext(dec, ".jpg")
+                    if trimmed and looks_plausible_jpeg(trimmed):
+                        return (f"smart-repxor[CuPy] klen={len(key_bytes)} off={off} scan@{pos}", off + pos, trimmed, ".jpg", dec)
+    return None
+
+
+# ---- GPU-accelerated smart repeating-XOR probe (optional, Numba CUDA) ----
+def gpu_smart_repxor_probe(buf: bytes, offsets: list[int], kmin: int = 2, kmax: int = 32, max_scan: int = 65536, *, threads_per_block: int = 128):
+    """Optional GPU variant of smart_repxor_probe using Numba CUDA.
+    Strategy: for each offset, derive candidate keys from JPEG cribs on CPU;
+    batch-check the first `max_scan` bytes of repeating-XOR transformed payload
+    on GPU for JPEG magic (FF D8 FF). On hit, validate on CPU and return.
+    Returns same tuple as smart_repxor_probe or None when no hit / GPU unavailable.
+    """
+    if not _NUMBA_CUDA_AVAILABLE:
+        return None
+    # Lazy imports to avoid hard dependency when GPU not used
+    try:
+        import numpy as np  # type: ignore
+        from numba import cuda  # type: ignore
+    except Exception:
+        return None
+
+    # Define CUDA kernel locally to avoid importing on non-GPU runs
+    @cuda.jit
+    def _probe_magic_kernel(data, data_n, keys2d, lens, max_klen, out_pos):
+        k = cuda.blockIdx.x  # key index
+        tid = cuda.threadIdx.x
+        stride = cuda.blockDim.x
+        if k >= lens.shape[0]:
+            return
+        klen = lens[k]
+        if klen <= 0:
+            return
+        # initialize found position to large number in thread 0
+        # use out_pos[k] as shared location; initialize only once
+        if tid == 0 and out_pos[k] == -2:
+            out_pos[k] = -1
+        cuda.syncthreads()
+        # Scan positions with striding
+        # Look for JPEG SOI pattern FF D8 FF
+        for i in range(tid, data_n - 2, stride):
+            b0 = data[i] ^ keys2d[k, i % klen]
+            b1 = data[i + 1] ^ keys2d[k, (i + 1) % klen]
+            b2 = data[i + 2] ^ keys2d[k, (i + 2) % klen]
+            if b0 == 0xFF and b1 == 0xD8 and b2 == 0xFF:
+                # try to set earliest position; use CAS loop to keep min
+                old = cuda.atomic.compare_and_swap(out_pos, k, -1, i)
+                if old != -1:
+                    # already something there; try to minimize
+                    while True:
+                        cur = out_pos[k]
+                        if cur == -1 or i < cur:
+                            prev = cuda.atomic.compare_and_swap(out_pos, k, cur, i)
+                            if prev == cur:
+                                break
+                        else:
+                            break
+                break  # stop this thread's scan after first local hit
+
+    n = len(buf)
+    for off in offsets:
+        if off + 16 >= n:
+            continue
+        # CPU: derive candidate keys using crib consistency
+        enc = buf[off: off + 64]
+        cand_keys: list[bytes] = []
+        cand_lens: list[int] = []
+        for crib in JPEG_CRIBS:
+            for klen in range(kmin, kmax + 1):
+                key = [None] * klen
+                ok = True
+                for idx, eb in crib.items():
+                    if idx >= len(enc):
+                        ok = False; break
+                    kb = enc[idx] ^ eb
+                    p = idx % klen
+                    if key[p] is None:
+                        key[p] = kb
+                    elif key[p] != kb:
+                        ok = False; break
+                if not ok:
+                    continue
+                key_bytes = bytes((b if b is not None else 0) for b in key)
+                cand_keys.append(key_bytes)
+                cand_lens.append(klen)
+        if not cand_keys:
+            continue
+        # Prepare device buffers
+        m = min(max_scan, n - off)
+        if m < 8:
+            continue
+        try:
+            # Payload slice to scan
+            h_data = np.frombuffer(buf, dtype=np.uint8, count=m, offset=off)
+            # Pack keys to 2D array with fixed width = max_klen
+            max_klen = max(cand_lens)
+            h_keys = np.zeros((len(cand_keys), max_klen), dtype=np.uint8)
+            for i, kbytes in enumerate(cand_keys):
+                h_keys[i, :len(kbytes)] = np.frombuffer(kbytes, dtype=np.uint8)
+            h_lens = np.array(cand_lens, dtype=np.int32)
+            # Output positions, init to -2 sentinel to let kernel set -1 first
+            h_out = np.full((len(cand_keys),), -2, dtype=np.int32)
+
+            d_data = cuda.to_device(h_data)
+            d_keys = cuda.to_device(h_keys)
+            d_lens = cuda.to_device(h_lens)
+            d_out = cuda.to_device(h_out)
+
+            blocks = len(cand_keys)
+            threads = max(32, min(threads_per_block, 256))
+            _probe_magic_kernel[blocks, threads](d_data, np.int32(m), d_keys, d_lens, np.int32(max_klen), d_out)
+            d_out.copy_to_host(h_out)
+
+            # Any hits?
+            for ki, pos in enumerate(h_out):
+                if pos is not None and isinstance(pos, (int, np.integer)) and int(pos) >= 0:
+                    key_bytes = cand_keys[ki]
+                    # CPU validate full decryption
+                    dec = repxor(buf[off:], key_bytes)
+                    if looks_like_image(dec[:16]) == ".jpg":
+                        trimmed = trim_to_image_ext(dec, ".jpg")
+                        if trimmed and looks_plausible_jpeg(trimmed):
+                            return (f"smart-repxor[GPU] klen={len(key_bytes)} off={off} scan@{int(pos)}", off + int(pos), trimmed, ".jpg", dec)
+                    sd = find_magic_positions(dec, max_scan)
+                    if sd and sd[0][1] == ".jpg":
+                        trimmed = trim_to_image_ext(dec, ".jpg")
+                        if trimmed and looks_plausible_jpeg(trimmed):
+                            return (f"smart-repxor[GPU] klen={len(key_bytes)} off={off} scan@{int(pos)}", off + int(pos), trimmed, ".jpg", dec)
+        except Exception:
+            # Any GPU failure should silently fall back to CPU later
+            continue
+    return None
+
 def try_all(buf: bytes, keys: list[bytes], offsets: list[int], max_scan: int):
 
     fast = globals().get("__FAST_MODE__", False)
@@ -718,6 +969,16 @@ def try_all(buf: bytes, keys: list[bytes], offsets: list[int], max_scan: int):
             return
 
     # Smart repeating-XOR probe (crib-based). Huge speedup if PSI used repxor with short key.
+    # Optional GPU-accelerated smart probe first
+    if globals().get("__GPU_ENABLED__", False):
+        # 先 CuPy，后 Numba（这台 Numba 挂了，所以基本会走 CuPy）
+        res = cupy_smart_repxor_probe(buf, offsets, kmin=2, kmax=32, max_scan=max_scan)
+        if not res:
+            res = gpu_smart_repxor_probe(buf, offsets, kmin=2, kmax=32, max_scan=max_scan,
+                                         threads_per_block=int(globals().get("__GPU_THREADS__", 128) or 128))
+        if res:
+            yield res
+            return
     res = smart_repxor_probe(buf, offsets, kmin=2, kmax=32, max_scan=max_scan)
     if res:
         yield res
@@ -931,6 +1192,8 @@ def main():
     ap.add_argument("--skip-repxor", action="store_true", help="Skip repeating-XOR transforms")
     ap.add_argument("--skip-lcg", action="store_true", help="Skip LCG XOR transforms")
     ap.add_argument("--probe-only", action="store_true", help="Only run the smart repeating-XOR probe (skip other transforms)")
+    ap.add_argument("--gpu", action="store_true", help="Enable Numba CUDA acceleration (smart repeating-XOR probe). Requires NVIDIA GPU + drivers")
+    ap.add_argument("--gpu-threads", type=int, default=128, help="Threads per block for CUDA kernels (default 128)")
     args = ap.parse_args()
 
     indir = Path(args.indir).expanduser()
@@ -983,6 +1246,15 @@ def main():
     globals()["__SKIP_RC4__"] = bool(args.skip_rc4)
     globals()["__SKIP_REPXOR__"] = bool(args.skip_repxor)
     globals()["__SKIP_LCG__"] = bool(args.skip_lcg)
+    # GPU flags
+    gpu_on = bool(args.gpu) and _NUMBA_CUDA_AVAILABLE
+    globals()["__GPU_ENABLED__"] = gpu_on
+    globals()["__GPU_THREADS__"] = int(args.gpu_threads) if args.gpu_threads else 128
+    if args.gpu:
+        if gpu_on:
+            print("[i] GPU mode: Numba CUDA available; smart probe will use GPU batches")
+        else:
+            print("[i] GPU mode requested but CUDA not available; falling back to CPU")
 
     keys = derive_keys(args.gesture, salt)
 
@@ -1002,7 +1274,15 @@ def main():
         # offsets to try (PSI-1 headers often small)
         offsets = guess_offsets(raw)
         if args.probe_only:
-            res = smart_repxor_probe(raw, offsets, kmin=2, kmax=32, max_scan=args.max_scan)
+            res = None
+            if globals().get("__GPU_ENABLED__", False):
+                # 先 CuPy，后 Numba（这台 Numba 挂了，所以基本会走 CuPy）
+                res = cupy_smart_repxor_probe(raw, offsets, kmin=2, kmax=32, max_scan=args.max_scan)
+                if not res:
+                    res = gpu_smart_repxor_probe(raw, offsets, kmin=2, kmax=32, max_scan=args.max_scan,
+                                                 threads_per_block=int(globals().get("__GPU_THREADS__", 128) or 128))
+            if not res:
+                res = smart_repxor_probe(raw, offsets, kmin=2, kmax=32, max_scan=args.max_scan)
             if res:
                 desc, off, payload, ext, fullbuf = res
                 out = outdir / (p.stem + ext)
